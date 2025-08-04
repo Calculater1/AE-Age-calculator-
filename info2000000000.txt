@@ -1,0 +1,206 @@
+import React, { useState, useEffect } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken } from 'firebase/auth';
+
+// ?? ?????????????? ???? ????? ?????? ??? ???? ???-????? ??? ??????? ????? ?????
+
+// Firebase ?????????? ??? ??????????
+const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+// API ??-? ???? ???? ???? ??????? ??????? ??? ???, ?? Canvas ??????? ?????? ?????? ??? ???
+const apiKey = "";
+const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${apiKey}`;
+
+// base64ToArrayBuffer ??? pcmToWav ????????? TTS-?? ???? ??????? ??? ???, ???? ?? ?????? TTS ??????? ??? ????? ???
+// ????, ??? ???? ???? ?????? ?????? ???? ?????? ???????
+const base64ToArrayBuffer = (base64) => {
+    const binaryString = window.atob(base64);
+    const len = binaryString.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+    }
+    return bytes.buffer;
+};
+
+const pcmToWav = (pcmData, sampleRate) => {
+    const pcm16 = new Int16Array(pcmData);
+    const buffer = new ArrayBuffer(44 + pcm16.length * 2);
+    const view = new DataView(buffer);
+
+    // WAV header
+    // RIFF identifier
+    writeString(view, 0, 'RIFF');
+    // RIFF chunk length
+    view.setUint32(4, 36 + pcm16.length * 2, true);
+    // 'WAVE' format
+    writeString(view, 8, 'WAVE');
+    // 'fmt ' sub-chunk
+    writeString(view, 12, 'fmt ');
+    // fmt sub-chunk size (16 for PCM)
+    view.setUint32(16, 16, true);
+    // audio format (1 for PCM)
+    view.setUint16(20, 1, true);
+    // number of channels (1)
+    view.setUint16(22, 1, true);
+    // sample rate
+    view.setUint32(24, sampleRate, true);
+    // byte rate
+    view.setUint32(28, sampleRate * 2, true);
+    // block align
+    view.setUint16(32, 2, true);
+    // bits per sample
+    view.setUint16(34, 16, true);
+    // 'data' sub-chunk
+    writeString(view, 36, 'data');
+    // data sub-chunk size
+    view.setUint32(40, pcm16.length * 2, true);
+
+    // write the PCM samples
+    let offset = 44;
+    for (let i = 0; i < pcm16.length; i++, offset += 2) {
+        view.setInt16(offset, pcm16[i], true);
+    }
+
+    return new Blob([view], { type: 'audio/wav' });
+};
+
+const writeString = (view, offset, string) => {
+    for (let i = 0; i < string.length; i++) {
+        view.setUint8(offset + i, string.charCodeAt(i));
+    }
+};
+
+const App = () => {
+    const [prompt, setPrompt] = useState(''); // ???????????? ?????
+    const [response, setResponse] = useState('????? ????? ????? ??????'); // ???-?? ?????
+    const [loading, setLoading] = useState(false); // ????? ?????
+    const [db, setDb] = useState(null); // Firebase ???????
+    const [auth, setAuth] = useState(null); // Firebase ??????????
+    const [userId, setUserId] = useState(null); // ???????????? ????
+
+    // Firebase ?????????? ?????
+    useEffect(() => {
+        const initFirebase = async () => {
+            try {
+                const app = initializeApp(firebaseConfig);
+                const authInstance = getAuth(app);
+                setAuth(authInstance);
+
+                const unsubscribe = authInstance.onAuthStateChanged(async (user) => {
+                    if (user) {
+                        setUserId(user.uid);
+                    } else {
+                        // ??? ???? ??????????? ?? ????, ????? ?????? ???? ?? ????
+                        const anonymousUser = await signInAnonymously(authInstance);
+                        setUserId(anonymousUser.user.uid);
+                    }
+                });
+
+                // ??? ?????? ?? ????? ?????? ????, ????? ??? ??????? ??? ???? ?? ????
+                if (typeof __initial_auth_token !== 'undefined') {
+                    await signInWithCustomToken(authInstance, __initial_auth_token);
+                }
+
+                return () => unsubscribe();
+            } catch (e) {
+                console.error("Firebase initialization failed:", e);
+            }
+        };
+
+        initFirebase();
+    }, [firebaseConfig]);
+
+    // ??? ???? ????? ??????? ???? ?????
+    const getAIResponse = async () => {
+        if (!prompt.trim()) return;
+
+        setLoading(true);
+        setResponse('');
+
+        try {
+            const chatHistory = [];
+            chatHistory.push({ role: "user", parts: [{ text: prompt }] });
+            const payload = { contents: chatHistory };
+
+            const fetchWithExponentialBackoff = async (url, options, retries = 3, delay = 1000) => {
+                try {
+                    const res = await fetch(url, options);
+                    if (!res.ok) {
+                        if (res.status === 429 && retries > 0) { // Too Many Requests
+                            await new Promise(resolve => setTimeout(resolve, delay));
+                            return fetchWithExponentialBackoff(url, options, retries - 1, delay * 2);
+                        }
+                        throw new Error(`HTTP error! status: ${res.status}`);
+                    }
+                    return res;
+                } catch (error) {
+                    throw error;
+                }
+            };
+
+            const response = await fetchWithExponentialBackoff(apiUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+
+            const result = await response.json();
+
+            if (result.candidates && result.candidates.length > 0 &&
+                result.candidates[0].content && result.candidates[0].content.parts &&
+                result.candidates[0].content.parts.length > 0) {
+                const text = result.candidates[0].content.parts[0].text;
+                setResponse(text);
+            } else {
+                setResponse("??????, ???? ????? ????? ??????");
+            }
+
+        } catch (error) {
+            console.error('Error fetching data from Gemini API:', error);
+            setResponse('???? ?????? ?????? ???? ??? ???? ?????? ?????');
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    return (
+        <div
+            className="flex flex-col items-center justify-center min-h-screen p-4 bg-cover bg-center"
+            style={{ backgroundImage: "url('https://images.unsplash.com/photo-1541701490216-92d6e6a17b8f?q=80&w=1974&auto=format&fit=crop&ixlib=rb-4.0.3&ixid=M3wxMjA3fDB8MHxwaG90by1wYWdlfHx8fGVufDB8fHx8fA%3D%3D')" }} // ?????? ?????? ????? ??? ??????? ??? ??????
+        >
+            <div className="bg-white bg-opacity-80 p-8 rounded-2xl shadow-xl max-w-4xl w-full flex flex-col items-center space-y-6">
+                <h1 className="text-4xl font-bold text-gray-800 text-center mb-4 font-inter">???-????? ??? ??????</h1>
+                <p className="text-center text-gray-600 font-inter">
+                    ????? ?????? ????? ?????? ??? ?????, ??????, ?? ???????? ????? ?????
+                </p>
+
+                <textarea
+                    className="w-full p-4 rounded-xl border-2 border-gray-300 focus:outline-none focus:ring-2 focus:ring-blue-500 transition-colors"
+                    rows="4"
+                    placeholder="????? ?????? ????? ???? ????..."
+                    value={prompt}
+                    onChange={(e) => setPrompt(e.target.value)}
+                ></textarea>
+
+                <button
+                    onClick={getAIResponse}
+                    disabled={loading}
+                    className="w-full md:w-auto px-8 py-3 bg-blue-600 text-white font-bold rounded-xl shadow-lg hover:bg-blue-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                    {loading ? '??????? ??? ??????? ????...' : '????? ???'}
+                </button>
+
+                <div className="w-full bg-gray-100 p-6 rounded-xl border-2 border-gray-200 mt-6">
+                    <h2 className="text-2xl font-semibold text-gray-700 mb-2 font-inter">???-?? ?????:</h2>
+                    <p className="text-gray-800 whitespace-pre-wrap font-inter">
+                        {response}
+                    </p>
+                </div>
+            </div>
+        </div>
+    );
+};
+
+export default App;
